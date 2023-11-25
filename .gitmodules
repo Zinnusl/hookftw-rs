@@ -1,3 +1,6 @@
 [submodule "extern/hookFTW"]
 	path = extern/hookFTW
 	url = git@github.com:Fahersto/hookFTW.git
+[submodule "extern/zydis-rs"]
+	path = extern/zydis-rs
+	url = git@github.com:zyantific/zydis-rs.git

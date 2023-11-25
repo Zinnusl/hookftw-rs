@@ -1,14 +1,16 @@
 [package]
-name = "hookFTW-rs"
+name = "hookftw-rs"
 version = "0.1.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-cxx = "*"
-autocxx = "*"
-
-[build-dependencies]
-autocxx-build = "*"
-miette = { version="*", features = [ "fancy" ] }
+clap = { version = "*", features = ["derive"] }
+libc = "*"
+anyhow = "*"
+winapi = { version = "*", features = ["sysinfoapi", "memoryapi"] }
+zydis = { git = "https://github.com/zyantific/zydis-rs", version = "4.1.1", features = [
+    "encoder",
+    "formatter",
+] }
