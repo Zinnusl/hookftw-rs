@@ -1,0 +1,3 @@
+[submodule "extern/hookFTW"]
+	path = extern/hookFTW
+	url = git@github.com:Fahersto/hookFTW.git
