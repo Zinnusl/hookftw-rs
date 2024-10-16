@@ -1,5 +1,3 @@
-![hookftw banner](img/hookftw_banner.png)
-![example workflow](https://github.com/fahersto/hookFTW/actions/workflows/cmake.yml/badge.svg)
 # hookFTW - hook for the win(dows)
 A hooking library for Windows (32/64 Bit) with Linux support.
 
