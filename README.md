@@ -1,4 +1,5 @@
 # hookFTW - hook for the win(dows)
+[![Rust](https://github.com/Zinnusl/hookftw-rs/actions/workflows/rust.yml/badge.svg)](https://github.com/Zinnusl/hookftw-rs/actions/workflows/rust.yml)
 A hooking library for Windows (32/64 Bit) with Linux support.
 
 Rust rewrite with improved usage.
