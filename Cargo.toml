@@ -9,7 +9,12 @@ edition = "2021"
 clap = { version = "*", features = ["derive"] }
 libc = "*"
 anyhow = "*"
-winapi = { version = "*", features = ["sysinfoapi", "memoryapi"] }
+winapi = { version = "*", features = [
+    "sysinfoapi",
+    "memoryapi",
+    "errhandlingapi",
+    "winbase",
+] }
 zydis = { git = "https://github.com/zyantific/zydis-rs", version = "4.1.1", features = [
     "encoder",
     "formatter",

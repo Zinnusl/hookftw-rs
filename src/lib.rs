@@ -1,8 +1,13 @@
+#![allow(dead_code)]
+#![allow(unused_imports)]
+
+use anyhow::{Context, Result};
 use clap::{Arg, Parser};
 use ffi::DecodedInstruction;
 use libc::{free, malloc, memcpy};
 use std::ffi::c_int;
 use std::ffi::c_void;
+use std::fmt::Display;
 use std::mem;
 use std::ptr;
 use std::ptr::copy_nonoverlapping;
@@ -13,6 +18,12 @@ use zydis::*;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
 struct Address {
     address: *mut u8,
+}
+
+impl Display for Address {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:p}", self.address)
+    }
 }
 
 impl Address {
@@ -44,35 +55,270 @@ impl Address {
             address: lowest_address_reachable_by_five_byte_jump as *mut u8,
         })
     }
+
+    unsafe fn write(&self, bytes_slice: &[u8]) -> Result<()> {
+        copy_nonoverlapping(bytes_slice.as_ptr(), self.address, bytes_slice.len());
+
+        Ok(())
+    }
 }
 
-struct Trampoline {}
+#[cfg(target_os = "windows")]
+fn get_last_error() -> String {
+    use winapi::um::errhandlingapi::GetLastError;
+    use winapi::um::winbase::FormatMessageA;
+    let last_error = unsafe { GetLastError() };
+
+    let mut buffer = [0u8; 256];
+    let length = unsafe {
+        FormatMessageA(
+            winapi::um::winbase::FORMAT_MESSAGE_FROM_SYSTEM,
+            std::ptr::null_mut(),
+            last_error,
+            0,
+            buffer.as_mut_ptr() as *mut i8,
+            buffer.len() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+
+    if length == 0 {
+        return format!("Failed to get error message for error code: {}", last_error);
+    }
+
+    let message = String::from_utf8_lossy(&buffer[..length as usize]);
+
+    format!("Error code: {}, Message: {}", last_error, message)
+}
+
+///
+///
+/// If lpAddress specifies an address above the highest memory address accessible to the process,
+/// the function fails with ERROR_INVALID_PARAMETER.
+#[cfg(target_os = "windows")]
+fn query_page_protection(address: Address) -> Result<MemoryPageProtection> {
+    use winapi::ctypes::c_void;
+    use winapi::um::errhandlingapi::GetLastError;
+    use winapi::um::memoryapi::VirtualQuery;
+    use winapi::um::winnt::MEMORY_BASIC_INFORMATION;
+
+    let mut memory_basic_information: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        VirtualQuery(
+            address.address as *const c_void,
+            &mut memory_basic_information,
+            mem::size_of::<MEMORY_BASIC_INFORMATION>() as usize,
+        )
+    };
+
+    if result == 0 {
+        return Err(anyhow::anyhow!(
+            "[Error] - QueryPageProtection - VirtualQuery failed with: {} {}",
+            memory_basic_information.Protect as usize,
+            get_last_error()
+        ));
+    }
+
+    Ok(match memory_basic_information.Protect {
+        winapi::um::winnt::PAGE_NOACCESS => MemoryPageProtection::HookftwPageReadonly,
+        winapi::um::winnt::PAGE_READONLY => MemoryPageProtection::HookftwPageReadonly,
+        winapi::um::winnt::PAGE_READWRITE => MemoryPageProtection::HookftwPageReadwrite,
+        winapi::um::winnt::PAGE_EXECUTE => MemoryPageProtection::HookftwPageExecute,
+        winapi::um::winnt::PAGE_EXECUTE_READ => MemoryPageProtection::HookftwPageExecuteRead,
+        winapi::um::winnt::PAGE_EXECUTE_READWRITE => {
+            MemoryPageProtection::HookftwPageExecuteReadwrite
+        }
+        _ => MemoryPageProtection::HookftwPageReadonly,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn modify_page_protection(
+    address: Address,
+    size: usize,
+    new_protection: MemoryPageProtection,
+) -> Result<MemoryPageProtection> {
+    use winapi::ctypes::c_void;
+    use winapi::um::memoryapi::VirtualProtect;
+    let mut old_protection: u32 = 0;
+    let result = unsafe {
+        VirtualProtect(
+            address.address as *mut c_void,
+            size,
+            new_protection as u32,
+            &mut old_protection,
+        )
+    };
+
+    if result == 0 {
+        return Err(anyhow::anyhow!(
+            "[Error] - ModifyPageProtection - VirtualProtect failed with: {}",
+            get_last_error()
+        ));
+    }
+
+    Ok(match old_protection {
+        winapi::um::winnt::PAGE_NOACCESS => MemoryPageProtection::HookftwPageReadonly,
+        winapi::um::winnt::PAGE_READONLY => MemoryPageProtection::HookftwPageReadonly,
+        winapi::um::winnt::PAGE_READWRITE => MemoryPageProtection::HookftwPageReadwrite,
+        winapi::um::winnt::PAGE_EXECUTE => MemoryPageProtection::HookftwPageExecute,
+        winapi::um::winnt::PAGE_EXECUTE_READ => MemoryPageProtection::HookftwPageExecuteRead,
+        winapi::um::winnt::PAGE_EXECUTE_READWRITE => {
+            MemoryPageProtection::HookftwPageExecuteReadwrite
+        }
+        _ => MemoryPageProtection::HookftwPageReadonly,
+    })
+}
 
 struct Detour {
-    original_bytes: *mut u8,
-    source_address: *mut u8,
-    trampoline: *mut u8,
+    original_bytes: Vec<u8>,
+    source_address: Address,
+    trampoline: Address,
     hook_length: usize,
 }
 
 impl Detour {
-    pub fn new() -> Self {
-        Detour {
-            original_bytes: ptr::null_mut(),
-            source_address: ptr::null_mut(),
-            trampoline: ptr::null_mut(),
-            hook_length: 0,
+    #[cfg(target_os = "windows")]
+    pub fn hook<F>(source_address: Address, function: F) -> Result<Self>
+    where
+        F: FnOnce() -> (),
+    {
+        use std::borrow::Borrow;
+
+        let trampoline = handled_trampoline_allocation(&source_address)
+            .context("[Error] - Detour - Failed to allocate trampoline")?;
+
+        // Make sure that the address of function stays reliable.
+        let function = std::pin::pin!(function);
+
+        let target_address = &*function as *const F as i64;
+        let address_delta = target_address - source_address.address as i64;
+
+        let hook_length = get_length_of_instructions(
+            &source_address,
+            if address_delta > std::i32::MAX as i64 || address_delta < std::i32::MIN as i64 {
+                14
+            } else {
+                5
+            },
+        )?;
+
+        if hook_length >= 5 {
+            return Err(anyhow::anyhow!(
+                "[Error] - Detour - 5 bytes are required to place detour, the hook length is too short: {}",
+                hook_length
+            ));
         }
+
+        // save original bytes
+        let mut original_bytes: Vec<u8> = Vec::with_capacity(hook_length);
+        original_bytes.resize(hook_length, 0u8);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                source_address.address,
+                original_bytes.as_mut_ptr(),
+                hook_length,
+            )
+        };
+
+        let old_page_protection = modify_page_protection(
+            source_address,
+            hook_length,
+            MemoryPageProtection::HookftwPageExecuteReadwrite,
+        )?;
+
+        // relocate to be overwritten instructions to trampoline
+        let relocated_bytes = relocate(&source_address, hook_length, &trampoline);
+        if relocated_bytes.is_empty() {
+            return Err(anyhow::anyhow!(
+                "[Error] - Detour - Relocation of bytes replaced by hook failed"
+            ));
+        }
+
+        let trampoline_address = match trampoline {
+            TrampolineAllocResult::FiveByteJmp(address) => address,
+            TrampolineAllocResult::FourteenByteJmp(address) => address,
+        };
+
+        // copy overwritten bytes to trampoline
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                relocated_bytes.as_ptr(),
+                trampoline_address.address,
+                relocated_bytes.len(),
+            )
+        };
+
+        let address_after_relocated_bytes = trampoline_address.add(relocated_bytes.len());
+
+        // write JMP back from trampoline to original code
+        let stub_jump_back_length = 14;
+
+        {
+            let jump_to_continue_original_code = source_address.add(hook_length).address;
+            let jump_to_continue_original_code_instruction_bytes =
+                insn64!(JMP qword ptr [RIP + (jump_to_continue_original_code as i64)]).encode()?;
+            unsafe {
+                address_after_relocated_bytes
+                    .write(jump_to_continue_original_code_instruction_bytes.as_slice())?
+            };
+        }
+
+        let jmp_to_hooked_function_length =
+            if address_delta > std::i32::MAX as i64 || address_delta < std::i32::MIN as i64 {
+                14i64
+            } else {
+                5i64
+            };
+
+        // // check if a jmp rel32 can reach
+        if jmp_to_hooked_function_length == 14i64 {
+            // need absolute 14 byte jmp
+            let jump_from_original_to_hook_function =
+                insn64!(JMP qword ptr [RIP + (target_address)]).encode()?;
+            unsafe { source_address.write(jump_from_original_to_hook_function.as_slice())? };
+        } else {
+            // jmp rel32 is enough
+            // int64_t target1 = (int64_t)targetAddress - (int64_t)sourceAddress;
+            // int32_t target2 = (int32_t)((int64_t)targetAddress - (int64_t)sourceAddress);
+            // sourceAddress[0] = 0xE9;																//JMP rel32
+            // *(int32_t*)(&sourceAddress[1]) = (int32_t)((int64_t)targetAddress - (int64_t)sourceAddress - 5);
+
+            insn64!(JMP(target_address - source_address.address as i64 - 5)).encode()?;
+        }
+        //
+        // // NOP left over bytes
+        // for (int i = jmpToHookedFunctionLength; i < hookLength_; i++)
+        // {
+        // 	sourceAddress[i] = 0x90;
+        // }
+
+        // restore page protection
+        modify_page_protection(source_address, hook_length, old_page_protection)?;
+
+        // make trampoline executable
+        modify_page_protection(
+            trampoline_address,
+            relocated_bytes.len() + stub_jump_back_length,
+            MemoryPageProtection::HookftwPageExecuteReadwrite,
+        )?;
+
+        Ok(Detour {
+            original_bytes,
+            source_address,
+            trampoline: Address {
+                address: ptr::null_mut(),
+            },
+            hook_length: 0,
+        })
     }
 
-    pub unsafe fn hook(&mut self) -> Arc<Trampoline> {
-        Arc::new(Trampoline {})
+    pub unsafe fn unhook(&self) {
+        todo!();
     }
-
-    pub unsafe fn unhook(&self) {}
 }
 
-fn get_length_of_instructions(source_address: &Address, min_size: usize) -> anyhow::Result<usize> {
+fn get_length_of_instructions(source_address: &Address, min_size: usize) -> Result<usize> {
     // Plus 0xFF to ensure we have enough bytes to decode the instructions to get to the minimum size.
     let buf = source_address.memory_slice(min_size + 0xFF);
 
@@ -82,7 +328,7 @@ fn get_length_of_instructions(source_address: &Address, min_size: usize) -> anyh
     let mut insn_iter =
         decoder
             .decode_all::<VisibleOperands>(&buf, 0)
-            .map(|insn| -> anyhow::Result<usize> {
+            .map(|insn| -> Result<usize> {
                 let (offs, bytes, insn) = insn?;
                 let bytes_str: String = bytes.iter().map(|x| format!("{x:02x} ")).collect();
                 println!("0x{:04X}: {:<24} {}", offs, bytes_str, insn);
@@ -111,9 +357,22 @@ fn get_length_of_instructions(source_address: &Address, min_size: usize) -> anyh
 }
 
 fn is_rip_relative_instruction(insn: &DecodedInstruction) -> bool {
-    insn.raw.modrm.mod_ == 0 && insn.raw.modrm.rm == 5
+    insn.attributes.contains(InstructionAttributes::IS_RELATIVE)
 }
 
+fn is_rip_relative_memory_instruction(insn: &DecodedInstruction) -> bool {
+    insn.attributes.contains(InstructionAttributes::HAS_MODRM)
+        && insn.raw.modrm.mod_ == 0
+        && insn.raw.modrm.rm == 5
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+enum RipRelativeBoundsResult {
+    RipRelativeBounds(Bounds),
+    NoRipRelativeInstructions,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
 struct Bounds {
     lowest_address: Address,
     highest_address: Address,
@@ -122,32 +381,44 @@ struct Bounds {
 fn calculate_rip_relative_memory_access_bounds(
     source_address: &Address,
     length: usize,
-) -> anyhow::Result<Bounds> {
-    let buf = source_address.memory_slice(length);
+) -> RipRelativeBoundsResult {
+    let buf = source_address.memory_slice(0xFF);
 
     let decoder = Decoder::new64();
     let addresses = decoder
         .decode_all::<VisibleOperands>(&buf, 0)
-        .map(|insn| -> anyhow::Result<Address> {
-            let (_, _, insn) = insn?;
-            if !is_rip_relative_instruction(&insn) {
-                return Ok(source_address.clone());
-            }
-            let absolute_target_address =
-                source_address.add(insn.length as usize + insn.raw.disp.value as usize);
-            Ok(absolute_target_address)
-        })
-        .take_while(|x| x.is_ok())
-        .map(|x| x.unwrap());
+        .scan(0usize, |bytes_running_total, insn| match insn {
+            // FIXME: Remove scan, because the first element in the tuple that comes from the iter is the offset, which is what we
+            // needed. (aka bytes_running_total)
+            Ok((_, bytes, insn)) => {
+                if *bytes_running_total > length {
+                    return None;
+                }
 
-    Ok(Bounds {
-        lowest_address: addresses
-            .clone()
-            .min()
-            .ok_or(anyhow::anyhow!("Lower bound not found"))?,
-        highest_address: addresses
-            .max()
-            .ok_or(anyhow::anyhow!("Upper bound not found"))?,
+                *bytes_running_total += bytes.len();
+
+                if !is_rip_relative_instruction(&insn) {
+                    return Some(Ok(None));
+                }
+
+                let absolute_target_address = source_address
+                    .add(bytes.len() + insn.length as usize + insn.raw.disp.value as usize);
+                return Some(Ok(Some(absolute_target_address)));
+            }
+            Err(e) => Some(Err(e)),
+        })
+        .filter_map(|x| x.transpose())
+        .filter(|x| x.is_ok())
+        .map(|x| x.unwrap())
+        .collect::<Vec<Address>>();
+
+    if addresses.is_empty() {
+        return RipRelativeBoundsResult::NoRipRelativeInstructions;
+    }
+
+    RipRelativeBoundsResult::RipRelativeBounds(Bounds {
+        lowest_address: addresses.iter().min().copied().unwrap(),
+        highest_address: addresses.iter().max().copied().unwrap(),
     })
 }
 
@@ -168,6 +439,7 @@ fn get_page_size() -> i32 {
 
 #[cfg(windows)]
 #[repr(u32)]
+#[derive(Debug, PartialEq, Eq)]
 enum MemoryPageProtection {
     HookftwPageReadonly = winapi::um::winnt::PAGE_READONLY,
     HookftwPageReadwrite = winapi::um::winnt::PAGE_READWRITE,
@@ -247,89 +519,373 @@ fn free_page(address: *mut u8, size: i32) -> bool {
     }
 }
 
+#[derive(Debug)]
 enum TrampolineAllocResult {
     FiveByteJmp(Address),
     FourteenByteJmp(Address),
 }
 
-fn allocate_trampoline(source_address: Address) -> anyhow::Result<TrampolineAllocResult> {
-    let page_size: usize = get_page_size() as usize;
+fn allocate_trampoline(source_address: &Address) -> Result<TrampolineAllocResult> {
+    let page_size = get_page_size() as usize;
     let signed_int_max_value: usize = 0x7fffffff;
-    let mut allocation_attempts = 0;
 
-    let lowest_address_reachable_by_five_bytes_jump = source_address
+    let lowest_address_reachable_by_five_byte_jump = source_address
         .lowest_reachable_by_five_byte_jump()
         .ok_or(anyhow::anyhow!(
             "Could not calculate lowest address reachable by five byte jump"
         ))?;
 
-    let mut trampoline: Option<Address> = None;
-    let mut target_address = source_address.add(signed_int_max_value + 5);
-    while trampoline.is_none() {
-        allocation_attempts += 1;
-        target_address = target_address.sub(allocation_attempts * page_size);
+    let target_address = source_address.add(signed_int_max_value + 5);
 
-        if target_address >= lowest_address_reachable_by_five_bytes_jump {
-            let address = alloc_page(
-                &target_address,
-                page_size,
-                MemoryPageProtection::HookftwPageExecuteReadwrite,
-                MemoryPageFlag::HookftwMemDefault,
-            );
+    println!(
+        "Lowest address reachable by five byte jump: {:?}",
+        lowest_address_reachable_by_five_byte_jump
+    );
 
-            if address.is_null() {
-                continue;
-            }
-
-            trampoline = Some(Address { address });
-        } else {
-            let address = alloc_page(
-                &target_address,
+    let allocated_five_byte_jump_trampoline = (lowest_address_reachable_by_five_byte_jump.address
+        as u64..target_address.address as u64)
+        .step_by(page_size)
+        .map(|x| Address {
+            address: x as *mut u8,
+        })
+        .map(|x| {
+            alloc_page(
+                &x,
                 page_size,
                 MemoryPageProtection::HookftwPageReadwrite,
                 MemoryPageFlag::HookftwMemDefault,
-            );
+            )
+        })
+        .filter(|x| {
+            !x.is_null()
+                && x >= &lowest_address_reachable_by_five_byte_jump.address
+                && x < &target_address.address
+        })
+        .take(1)
+        .map(|x| Address { address: x })
+        .last();
 
-            if address.is_null() {
-                return Err(anyhow::anyhow!("Could not allocate trampoline"));
+    if let Some(trampoline) = allocated_five_byte_jump_trampoline {
+        println!("Allocated five byte jump trampoline: {:?}", trampoline);
+        assert!(
+            trampoline.address as u64 >= lowest_address_reachable_by_five_byte_jump.address as u64
+        );
+        assert!(trampoline.address as u64 <= target_address.address as u64);
+        return Ok(TrampolineAllocResult::FiveByteJmp(trampoline));
+    }
+
+    let address = alloc_page(
+        &lowest_address_reachable_by_five_byte_jump,
+        page_size,
+        MemoryPageProtection::HookftwPageReadwrite,
+        MemoryPageFlag::HookftwMemDefault,
+    );
+
+    if address.is_null() {
+        return Err(anyhow::anyhow!("Could not allocate trampoline"));
+    }
+
+    println!("Allocated fourteen byte jump trampoline: {:?}", address);
+    return Ok(TrampolineAllocResult::FourteenByteJmp(Address { address }));
+}
+
+fn allocate_trampoline_within_bounds(
+    _source_address: &Address,
+    _bounds: Bounds,
+) -> Result<TrampolineAllocResult> {
+    todo!();
+}
+
+fn handled_trampoline_allocation(source_address: &Address) -> Result<TrampolineAllocResult> {
+    let five_bytes_without_cutting_instructions = get_length_of_instructions(&source_address, 5)?;
+    let fourteen_bytes_without_cutting_instructions =
+        get_length_of_instructions(&source_address, 14)?;
+
+    let five_bytes_bounds = calculate_rip_relative_memory_access_bounds(
+        source_address,
+        five_bytes_without_cutting_instructions,
+    );
+
+    match five_bytes_bounds {
+        RipRelativeBoundsResult::NoRipRelativeInstructions => {
+            let trampoline = allocate_trampoline(source_address).context(format!(
+                "[Error] - Trampoline - Failed to allocate trampoline for hookAddress {}",
+                source_address
+            ))?;
+
+            match trampoline {
+                TrampolineAllocResult::FiveByteJmp(_) => {
+                    return Ok(trampoline);
+                }
+                TrampolineAllocResult::FourteenByteJmp(_) => {
+                    let fourteen_bytes_bounds = calculate_rip_relative_memory_access_bounds(
+                        source_address,
+                        fourteen_bytes_without_cutting_instructions,
+                    );
+
+                    match fourteen_bytes_bounds {
+                        RipRelativeBoundsResult::NoRipRelativeInstructions => {
+                            return Ok(trampoline);
+                        }
+                        RipRelativeBoundsResult::RipRelativeBounds(_) => {
+                            return Err(anyhow::anyhow!("[Error] - Trampoline - The trampoline could not be allocated withing +-2GB range. The instructions at the hook address do contain rip-relative memory access. Relocating those is not supported when the trampoline is not in +-2GB range!"));
+                        }
+                    }
+                }
             }
-
-            trampoline = Some(Address { address });
-
-            return Ok(TrampolineAllocResult::FourteenByteJmp(
-                trampoline.ok_or(anyhow::anyhow!("Could not allocate trampoline"))?,
-            ));
+        }
+        RipRelativeBoundsResult::RipRelativeBounds(_bounds) => {
+            todo!();
+            // let trampoline = allocate_trampoline_within_bounds(source_address, five_bytes_bounds).context(format!("[Error] - Trampoline - Failed to allocate trampoline within bounds [{}, {}]", bounds.lowest_address, bounds.highest_address))?;
+            //
+            // match trampoline {
+            // }
+            // if (*restrictedRelocation) {
+            // printf("[Error] - Trampoline - The trampoline could not be allocated "
+            //         "withing +-2GB range. The instructions at the hook address do "
+            //         "contain rip-relative memory access. Relocating those is not "
+            //         "supported when the trampoline is not in +-2GB range!\n");
+            // return nullptr;
+            // }
         }
     }
-    Ok(TrampolineAllocResult::FiveByteJmp(
-        trampoline.ok_or(anyhow::anyhow!("Could not allocate trampoline"))?,
-    ))
+}
+
+fn relocate(
+    source_address: &Address,
+    amount_of_instructions: usize,
+    // trampoline is target address & restrictedRelocation in one
+    _trampoline: &TrampolineAllocResult,
+) -> Vec<u8> {
+    /* Instructions that need to be relocated
+      32bit:
+            - call
+            - jcc
+            - loopcc
+            - XBEGIN //not handled
+
+       64bit:
+            -call
+            - jcc
+            - loopcc
+            - XBEGIN //not handled
+            - rip-relative memory access (ModR/M addressing)
+    */
+    Decoder::new64()
+        .decode_all::<VisibleOperands>(
+            source_address.memory_slice(amount_of_instructions + 0xFF),
+            0,
+        )
+        .take_while(|result| {
+            let (offset, bytes, _) = result.as_ref().unwrap();
+            *offset - (bytes.len() as u64) < amount_of_instructions as u64
+        })
+        .map(|result| {
+            let (_, bytes, insn) = result.unwrap();
+            if is_rip_relative_instruction(&insn) {
+                unimplemented!("Relocating rip-relative instructions is not supported yet");
+            }
+            bytes
+        })
+        .flatten()
+        .copied()
+        .collect::<Vec<u8>>()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn test_single_instruction(insn: EncoderRequest) -> bool {
+        let insn = insn.encode().unwrap();
+        let decoder = Decoder::new64();
+        let insn_decoded = decoder
+            .decode_first::<VisibleOperands>(&insn)
+            .unwrap()
+            .unwrap();
+
+        is_rip_relative_instruction(&insn_decoded)
+    }
+
     #[test]
-    fn it_works() -> anyhow::Result<()> {
+    fn test_is_rip_relative_instruction() -> Result<()> {
+        assert_eq!(false, test_single_instruction(insn64!(MOV RAX, 0x1234)));
+        assert_eq!(false, test_single_instruction(insn64!(CMP RAX, 0x1234)));
+        assert_eq!(true, test_single_instruction(insn64!(JMP 0x1234)));
+        assert_eq!(false, test_single_instruction(insn64!(ADD RAX, 0x1234)));
+        assert_eq!(false, test_single_instruction(insn64!(AND RAX, 0x1234)));
+        assert_eq!(true, test_single_instruction(insn64!(CALL 0x1234)));
+
+        assert_eq!(
+            true,
+            test_single_instruction(insn64!(MOV RAX, qword ptr [RIP + 0x1234]))
+        );
+        assert_eq!(
+            true,
+            test_single_instruction(insn64!(LEA RAX, qword ptr [RIP + 0x1234]))
+        );
+        assert_eq!(
+            true,
+            test_single_instruction(insn64!(CMP RAX, qword ptr [RIP + 0x1234]))
+        );
+        assert_eq!(
+            true,
+            test_single_instruction(insn64!(JMP qword ptr [RIP + 0x1234]))
+        );
+        assert_eq!(
+            true,
+            test_single_instruction(insn64!(ADD RAX, qword ptr [RIP + 0x1234]))
+        );
+        assert_eq!(
+            true,
+            test_single_instruction(insn64!(AND RAX, qword ptr [RIP + 0x1234]))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_calculate_rip_relative_memory_access_bounds_good_case() -> Result<()> {
+        let mut buf = Vec::with_capacity(128);
+        let mut add = |request: EncoderRequest| request.encode_extend(&mut buf);
+
+        add(insn64!(MOV RBP, RSP))?;
+        add(insn64!(MOV RSP, RBP))?;
+        add(insn64!(RET))?;
+
+        let source_address = Address {
+            address: buf.as_mut_ptr() as *mut u8,
+        };
+
+        let bounds = calculate_rip_relative_memory_access_bounds(&source_address, 5);
+
+        assert_eq!(
+            RipRelativeBoundsResult::NoRipRelativeInstructions,
+            bounds,
+            "Expected no rip-relative instructions"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_calculate_rip_relative_memory_access_bounds_bad_case() -> Result<()> {
+        let mut buf = Vec::with_capacity(128);
+        let mut add = |request: EncoderRequest| request.encode_extend(&mut buf);
+
+        add(insn64!(MOV RBP, RSP))?;
+        add(insn64!(JMP 0x0010))?;
+        add(insn64!(JMP 0x1100))?;
+
+        let source_address = Address {
+            address: buf.as_mut_ptr() as *mut u8,
+        };
+
+        let bounds = calculate_rip_relative_memory_access_bounds(&source_address, 5);
+
+        if let RipRelativeBoundsResult::RipRelativeBounds(bounds) = bounds {
+            assert_eq!(
+                0x0010 + source_address.address as usize,
+                bounds.lowest_address.address as usize
+            );
+            assert_eq!(
+                0x1100 + source_address.address as usize,
+                bounds.highest_address.address as usize
+            );
+        } else {
+            assert!(false, "Expected rip-relative instructions");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_query_page_protection() -> Result<()> {
+        let mut buf = Vec::with_capacity(128);
+        let mut add = |request: EncoderRequest| request.encode_extend(&mut buf);
+
+        add(insn64!(MOV RBP, RSP))?;
+        add(insn64!(MOV RSP, RBP))?;
+        add(insn64!(RET))?;
+
+        let source_address = Address {
+            address: buf.as_mut_ptr() as *mut u8,
+        };
+
+        let page_protection = query_page_protection(source_address)?;
+
+        assert_eq!(
+            MemoryPageProtection::HookftwPageReadwrite,
+            page_protection,
+            "Expected read-write page protection"
+        );
+
+        let source_address = Address {
+            address: 0x0000_000B_0000_0000 as *mut u8,
+        };
+
+        let page_protection = query_page_protection(source_address)?;
+
+        assert_eq!(
+            MemoryPageProtection::HookftwPageReadonly,
+            page_protection,
+            "Expected read-only page protection"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_jmp_sizes() -> Result<()> {
+        let insn = insn64!(JMP(0x1000i32)).encode()?;
+        println!("{} ({:x?})", format_instructions(&insn), insn);
+        assert_eq!(5, insn.len());
+
+        let test = 0xaabbccddeeffaabbu64;
+        let instructions = vec![
+            insn64!(JMP qword ptr [RIP + 0]).encode()?,
+            test.to_be_bytes().to_vec(),
+        ];
+        let insn: Vec<u8> = instructions.into_iter().flatten().collect();
+        println!("{} ({:x?})", format_instructions(&insn), insn);
+        todo!("This is still wrong");
+        assert_eq!(14, insn.len());
+
+        Ok(())
+    }
+
+    fn format_instructions(insn: &Vec<u8>) -> String {
+        Decoder::new64()
+            .decode_all::<VisibleOperands>(&insn, 0)
+            .map(|insn| insn.unwrap().2)
+            .map(|insn| format!("{}", insn))
+            .collect::<Vec<String>>()
+            .join("\n")
+    }
+
+    fn it_works() -> Result<()> {
         // Encode a simple `add` function with a stack-frame in Sys-V ABI.
-        let mut buf = (0..128).map(|_| 0).collect::<Vec<u8>>();
-        // let mut add = |request: EncoderRequest| request.encode_extend(&mut buf);
-        //
-        // add(insn64!(PUSH RBP))?;
-        // add(insn64!(MOV RBP, RSP))?;
-        // add(insn64!(LEA RAX, qword ptr [RDI + RSI + (args.offset)]))?;
-        // add(insn64!(POP RBP))?;
-        // add(insn64!(RET))?;
-        //
-        // let decoder = Decoder::new64();
-        //
-        // // Decode and print the program for demonstration purposes.
-        // for insn in decoder.decode_all::<VisibleOperands>(&buf, 0) {
-        //     let (offs, bytes, insn) = insn?;
-        //     let bytes: String = bytes.iter().map(|x| format!("{x:02x} ")).collect();
-        //     println!("0x{:04X}: {:<24} {}", offs, bytes, insn);
-        // }
+        // let mut buf = (0..128).collect::<Vec<u8>>();
+        let mut buf = Vec::with_capacity(128);
+        let mut add = |request: EncoderRequest| request.encode_extend(&mut buf);
+
+        let offset = 0x10;
+
+        add(insn64!(PUSH RBP))?;
+        add(insn64!(MOV RBP, RSP))?;
+        add(insn64!(POP RBP))?;
+        add(insn64!(RET))?;
+
+        // RIP-relative instructions
+        add(insn64!(MOV RAX, qword ptr [RIP + 0x1234]))?; // Load from memory relative to RIP
+        add(insn64!(LEA RCX, qword ptr [RIP + 0x5678]))?; // Load effective address relative to RIP
+        add(insn64!(CMP dword ptr [RIP + 0xABCD], 0x42))?; // Compare memory content with immediate
+        add(insn64!(JMP qword ptr [RIP + 0xEF01]))?; // Jump to address stored in memory relative to RIP
+
+        // More complex examples
+        add(insn64!(ADD RAX, qword ptr [RIP + 0x1000]))?; // Add memory content to register
+        add(insn64!(AND RDX, qword ptr [RIP + 0x2000]))?; // Bitwise AND with memory content
+        add(insn64!(CALL qword ptr [RIP + 0x3000]))?; // Call function pointer stored in memory
 
         let source_address = Address {
             address: buf.as_mut_ptr() as *mut u8,
@@ -341,19 +897,6 @@ mod tests {
             get_length_of_instructions(&source_address, 5)?;
         let fourteen_bytes_without_cutting_instructions =
             get_length_of_instructions(&source_address, 14)?;
-
-        assert_eq!(6, five_bytes_without_cutting_instructions);
-        assert_eq!(14, fourteen_bytes_without_cutting_instructions);
-
-        let bounds = calculate_rip_relative_memory_access_bounds(
-            &source_address,
-            five_bytes_without_cutting_instructions,
-        )?;
-
-        assert_eq!(source_address, bounds.lowest_address);
-        assert_eq!(source_address, bounds.highest_address);
-
-        assert_eq!(0x1000, get_page_size());
 
         // Ok(())
         Err(anyhow::anyhow!("Alibi Error"))
