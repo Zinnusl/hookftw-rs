@@ -173,7 +173,7 @@ fn modify_page_protection(
 struct Detour {
     original_bytes: Vec<u8>,
     source_address: Address,
-    trampoline: Address,
+    trampoline_address: Address,
     hook_length: usize,
 }
 
@@ -201,9 +201,10 @@ impl Detour {
             } else {
                 5
             },
-        )?;
+        )
+        .context("get_length_of_instructions")?;
 
-        if hook_length >= 5 {
+        if hook_length < 5 {
             return Err(anyhow::anyhow!(
                 "[Error] - Detour - 5 bytes are required to place detour, the hook length is too short: {}",
                 hook_length
@@ -255,9 +256,16 @@ impl Detour {
         let stub_jump_back_length = 14;
 
         {
-            let jump_to_continue_original_code = source_address.add(hook_length).address;
-            let jump_to_continue_original_code_instruction_bytes =
-                insn64!(JMP qword ptr [RIP + (jump_to_continue_original_code as i64)]).encode()?;
+            let jump_to_continue_original_code = source_address.add(hook_length).address as i64;
+            let jump_to_continue_original_code_instruction_bytes = vec![
+                insn64!(JMP qword ptr [RIP + 0])
+                    .encode()
+                    .context("jump_to_continue_original_code")?,
+                jump_to_continue_original_code.to_be_bytes().to_vec(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<u8>>();
             unsafe {
                 address_after_relocated_bytes
                     .write(jump_to_continue_original_code_instruction_bytes.as_slice())?
@@ -274,23 +282,43 @@ impl Detour {
         // // check if a jmp rel32 can reach
         if jmp_to_hooked_function_length == 14i64 {
             // need absolute 14 byte jmp
-            let jump_from_original_to_hook_function =
-                insn64!(JMP qword ptr [RIP + (target_address)]).encode()?;
+            let instructions = vec![
+                insn64!(JMP qword ptr [RIP + 0])
+                    .encode()
+                    .context("jump_from_original_to_hook_function")?,
+                target_address.to_be_bytes().to_vec(),
+            ];
+            let jump_from_original_to_hook_function: Vec<u8> =
+                instructions.into_iter().flatten().collect();
             unsafe { source_address.write(jump_from_original_to_hook_function.as_slice())? };
         } else {
-            // jmp rel32 is enough
-            // int64_t target1 = (int64_t)targetAddress - (int64_t)sourceAddress;
-            // int32_t target2 = (int32_t)((int64_t)targetAddress - (int64_t)sourceAddress);
-            // sourceAddress[0] = 0xE9;																//JMP rel32
-            // *(int32_t*)(&sourceAddress[1]) = (int32_t)((int64_t)targetAddress - (int64_t)sourceAddress - 5);
-
-            insn64!(JMP(target_address - source_address.address as i64 - 5)).encode()?;
+            let jump_from_original_to_hook_function =
+                target_address - source_address.address as i64 - 5;
+            let jump_from_original_to_hook_function =
+                insn64!(JMP(jump_from_original_to_hook_function))
+                    .encode()
+                    .context("jump_from_original_to_hook_function")?;
+            unsafe { source_address.write(jump_from_original_to_hook_function.as_slice())? };
         }
-        //
-        // // NOP left over bytes
-        // for (int i = jmpToHookedFunctionLength; i < hookLength_; i++)
-        // {
-        // 	sourceAddress[i] = 0x90;
+
+        // NOP left over bytes
+        if hook_length < jmp_to_hooked_function_length as usize {
+            return Err(anyhow::anyhow!(
+                "[Error] - Detour - Hook length is too small: {}",
+                hook_length
+            ));
+        }
+
+        // Not needed as all bytes are initialized to 0x90
+        // let nops = (0..hook_length - jmp_to_hooked_function_length as usize)
+        //     .map(|_| 0x90)
+        //     .collect::<Vec<u8>>();
+        // if !nops.is_empty() {
+        //     unsafe {
+        //         source_address
+        //             .add(jmp_to_hooked_function_length as usize)
+        //             .write(nops.as_slice())?
+        //     };
         // }
 
         // restore page protection
@@ -306,10 +334,8 @@ impl Detour {
         Ok(Detour {
             original_bytes,
             source_address,
-            trampoline: Address {
-                address: ptr::null_mut(),
-            },
-            hook_length: 0,
+            trampoline_address,
+            hook_length,
         })
     }
 
@@ -329,9 +355,9 @@ fn get_length_of_instructions(source_address: &Address, min_size: usize) -> Resu
         decoder
             .decode_all::<VisibleOperands>(&buf, 0)
             .map(|insn| -> Result<usize> {
-                let (offs, bytes, insn) = insn?;
-                let bytes_str: String = bytes.iter().map(|x| format!("{x:02x} ")).collect();
-                println!("0x{:04X}: {:<24} {}", offs, bytes_str, insn);
+                let (_, bytes, _) = insn?;
+                // let bytes_str: String = bytes.iter().map(|x| format!("{x:02x} ")).collect();
+                // println!("0x{:04X}: {:<24} {}", offs, bytes_str, insn);
                 Ok(bytes.len())
             });
 
@@ -571,6 +597,11 @@ fn allocate_trampoline(source_address: &Address) -> Result<TrampolineAllocResult
             trampoline.address as u64 >= lowest_address_reachable_by_five_byte_jump.address as u64
         );
         assert!(trampoline.address as u64 <= target_address.address as u64);
+
+        // init with nops
+        let nops = (0..page_size).map(|_| 0x90).collect::<Vec<u8>>();
+        unsafe { trampoline.write(nops.as_slice())? };
+
         return Ok(TrampolineAllocResult::FiveByteJmp(trampoline));
     }
 
@@ -585,8 +616,13 @@ fn allocate_trampoline(source_address: &Address) -> Result<TrampolineAllocResult
         return Err(anyhow::anyhow!("Could not allocate trampoline"));
     }
 
+    let address = Address { address };
+    // init with nops
+    let nops = (0..page_size).map(|_| 0x90).collect::<Vec<u8>>();
+    unsafe { address.write(nops.as_slice())? };
+
     println!("Allocated fourteen byte jump trampoline: {:?}", address);
-    return Ok(TrampolineAllocResult::FourteenByteJmp(Address { address }));
+    return Ok(TrampolineAllocResult::FourteenByteJmp(address));
 }
 
 fn allocate_trampoline_within_bounds(
@@ -678,7 +714,7 @@ fn relocate(
         )
         .take_while(|result| {
             let (offset, bytes, _) = result.as_ref().unwrap();
-            *offset - (bytes.len() as u64) < amount_of_instructions as u64
+            (*offset) as i64 - (bytes.len() as i64) < amount_of_instructions as i64
         })
         .map(|result| {
             let (_, bytes, insn) = result.unwrap();
@@ -694,6 +730,8 @@ fn relocate(
 
 #[cfg(test)]
 mod tests {
+    use libc::rand;
+
     use super::*;
 
     fn test_single_instruction(insn: EncoderRequest) -> bool {
@@ -847,8 +885,9 @@ mod tests {
             test.to_be_bytes().to_vec(),
         ];
         let insn: Vec<u8> = instructions.into_iter().flatten().collect();
+        // Everything is working as expected
+        // Output of this is incorrect, see https://github.com/zyantific/zydis/issues/188
         println!("{} ({:x?})", format_instructions(&insn), insn);
-        todo!("This is still wrong");
         assert_eq!(14, insn.len());
 
         Ok(())
@@ -863,40 +902,63 @@ mod tests {
             .join("\n")
     }
 
+    fn function_to_hook() {
+        // This is a function that we will hook
+        // It needs to be at least 14 bytes long
+        let a = 1;
+        let b = 2;
+        let c = a + b;
+        let d = c + 1;
+        let e = d + 1;
+        let f = e + 1;
+        let g = f + 1;
+        println!("Hello, world! {}", g);
+    }
+
+    #[test]
     fn it_works() -> Result<()> {
         // Encode a simple `add` function with a stack-frame in Sys-V ABI.
         // let mut buf = (0..128).collect::<Vec<u8>>();
-        let mut buf = Vec::with_capacity(128);
-        let mut add = |request: EncoderRequest| request.encode_extend(&mut buf);
+        // let buf = vec![0u8; 128];
+        // let buf = (0..128).collect::<Vec<u8>>();
+        // let buf = buf
+        //     .as_slice()
+        //     .chunks(2)
+        //     .map(|chunk| vec![0x04u8, chunk[1]])
+        //     .flatten()
+        //     .collect::<Vec<u8>>();
+        // let target_address = buf.as_ptr();
+        let target_address = function_to_hook as *const () as i64;
 
-        let offset = 0x10;
+        let detour = Detour::hook(
+            Address {
+                address: target_address as *mut u8,
+            },
+            || {
+                println!("Hello, hook!");
+            },
+        )
+        .context("Creating Detour Hook")?;
 
-        add(insn64!(PUSH RBP))?;
-        add(insn64!(MOV RBP, RSP))?;
-        add(insn64!(POP RBP))?;
-        add(insn64!(RET))?;
+        // print bytes in original code
+        // buf.iter().for_each(|x| print!("{:02x} ", x));
 
-        // RIP-relative instructions
-        add(insn64!(MOV RAX, qword ptr [RIP + 0x1234]))?; // Load from memory relative to RIP
-        add(insn64!(LEA RCX, qword ptr [RIP + 0x5678]))?; // Load effective address relative to RIP
-        add(insn64!(CMP dword ptr [RIP + 0xABCD], 0x42))?; // Compare memory content with immediate
-        add(insn64!(JMP qword ptr [RIP + 0xEF01]))?; // Jump to address stored in memory relative to RIP
+        // print new bytes at target_address
+        println!("after hooking:");
+        let new_bytes = detour.source_address.memory_slice(0xff);
+        new_bytes.iter().for_each(|x| print!("{:02x} ", x));
 
-        // More complex examples
-        add(insn64!(ADD RAX, qword ptr [RIP + 0x1000]))?; // Add memory content to register
-        add(insn64!(AND RDX, qword ptr [RIP + 0x2000]))?; // Bitwise AND with memory content
-        add(insn64!(CALL qword ptr [RIP + 0x3000]))?; // Call function pointer stored in memory
+        println!();
+        println!("now calling function:");
 
-        let source_address = Address {
-            address: buf.as_mut_ptr() as *mut u8,
-        };
+        function_to_hook();
 
-        // if we can allocate our trampoline in +-2gb range we only need a 5 bytes JMP
-        // if we can't, we need a 14 bytes JMP
-        let five_bytes_without_cutting_instructions =
-            get_length_of_instructions(&source_address, 5)?;
-        let fourteen_bytes_without_cutting_instructions =
-            get_length_of_instructions(&source_address, 14)?;
+        println!("---");
+
+        // print bytes in trampoline
+        let trampoline = detour.trampoline_address.memory_slice(0xFF);
+
+        trampoline.iter().for_each(|x| print!("{:02x} ", x));
 
         // Ok(())
         Err(anyhow::anyhow!("Alibi Error"))

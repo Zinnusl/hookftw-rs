@@ -19,3 +19,4 @@ zydis = { git = "https://github.com/zyantific/zydis-rs", version = "4.1.1", feat
     "encoder",
     "formatter",
 ] }
+rand = "*"
