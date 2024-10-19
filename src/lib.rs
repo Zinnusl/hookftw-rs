@@ -34,6 +34,34 @@ impl Address {
         unsafe { slice::from_raw_parts(self.address, length) }
     }
 
+    fn decode_up_to(&self, length: usize) -> Result<Vec<String>> {
+        let buf = self.memory_slice(length + 0xFF);
+        Ok(Decoder::new64()
+            .decode_all::<VisibleOperands>(&buf, 0)
+            .take_while(|result| {
+                let (offset, bytes, _) = result.as_ref().unwrap();
+                (*offset) as i64 - (bytes.len() as i64) < length as i64
+            })
+            .filter(|x| x.is_ok())
+            .map(|x| x.unwrap())
+            .map(|insn| {
+                let (offset, bytes, insn) = insn;
+                format!("0x{:04X}: {:?} {}", offset, bytes, insn)
+            })
+            .collect())
+    }
+
+    fn print_up_to(&self, length: usize) -> Result<()> {
+        for instruction in self
+            .decode_up_to(length)
+            .context("Failed to decode instructions")?
+        {
+            println!("{}", instruction);
+        }
+
+        Ok(())
+    }
+
     fn add(&self, offset: usize) -> Address {
         Address {
             address: unsafe { self.address.add(offset) },
@@ -286,14 +314,14 @@ impl Detour {
                 insn64!(JMP qword ptr [RIP + 0])
                     .encode()
                     .context("jump_from_original_to_hook_function")?,
-                target_address.to_be_bytes().to_vec(),
+                (trampoline_address.address as usize).to_be_bytes().to_vec(),
             ];
             let jump_from_original_to_hook_function: Vec<u8> =
                 instructions.into_iter().flatten().collect();
             unsafe { source_address.write(jump_from_original_to_hook_function.as_slice())? };
         } else {
             let jump_from_original_to_hook_function =
-                target_address - source_address.address as i64 - 5;
+                trampoline_address.address as i64 - source_address.address as i64 - 5;
             let jump_from_original_to_hook_function =
                 insn64!(JMP(jump_from_original_to_hook_function))
                     .encode()
@@ -806,7 +834,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
     fn test_calculate_rip_relative_memory_access_bounds_bad_case() -> Result<()> {
         let mut buf = Vec::with_capacity(128);
         let mut add = |request: EncoderRequest| request.encode_extend(&mut buf);
@@ -928,7 +955,7 @@ mod tests {
         //     .flatten()
         //     .collect::<Vec<u8>>();
         // let target_address = buf.as_ptr();
-        let target_address = function_to_hook as *const () as i64;
+        let target_address = function_to_hook as *const () as *mut u8;
 
         let detour = Detour::hook(
             Address {
@@ -945,20 +972,28 @@ mod tests {
 
         // print new bytes at target_address
         println!("after hooking:");
-        let new_bytes = detour.source_address.memory_slice(0xff);
-        new_bytes.iter().for_each(|x| print!("{:02x} ", x));
+        // Address {
+        //     address: target_address,
+        // }
+        // .print_up_to(50)?;
+        let p = detour.source_address.memory_slice(0xFF);
+        p.iter().for_each(|x| print!("{:02x} ", x));
 
+        println!("---");
         println!();
+        println!(
+            "tramp_addr: {} ({:x?})",
+            detour.trampoline_address,
+            (detour.trampoline_address.address as usize).to_be_bytes()
+        );
         println!("now calling function:");
-
-        function_to_hook();
-
         println!("---");
 
         // print bytes in trampoline
         let trampoline = detour.trampoline_address.memory_slice(0xFF);
-
         trampoline.iter().for_each(|x| print!("{:02x} ", x));
+        println!();
+        function_to_hook();
 
         // Ok(())
         Err(anyhow::anyhow!("Alibi Error"))
