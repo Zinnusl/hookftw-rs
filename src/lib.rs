@@ -26,6 +26,36 @@ impl Display for Address {
     }
 }
 
+impl<T> From<*mut T> for Address {
+    fn from(address: *mut T) -> Self {
+        Address {
+            address: address as *mut u8,
+        }
+    }
+}
+
+impl From<usize> for Address {
+    fn from(address: usize) -> Self {
+        Address {
+            address: address as *mut u8,
+        }
+    }
+}
+
+impl From<u64> for Address {
+    fn from(address: u64) -> Self {
+        Address {
+            address: address as *mut u8,
+        }
+    }
+}
+
+impl Into<usize> for Address {
+    fn into(self) -> usize {
+        self.address as usize
+    }
+}
+
 impl Address {
     /// Returns a slice of the memory at the address.
     /// # Safety
@@ -86,6 +116,12 @@ impl Address {
 
     unsafe fn write(&self, bytes_slice: &[u8]) -> Result<()> {
         copy_nonoverlapping(bytes_slice.as_ptr(), self.address, bytes_slice.len());
+        println!(
+            "Wrote {} ({:x?}) bytes to address: {:x?}",
+            bytes_slice.len(),
+            bytes_slice,
+            (self.address as usize).to_be_bytes()
+        );
 
         Ok(())
     }
@@ -207,20 +243,19 @@ struct Detour {
 
 impl Detour {
     #[cfg(target_os = "windows")]
-    pub fn hook<F>(source_address: Address, function: F) -> Result<Self>
-    where
-        F: FnOnce() -> (),
-    {
+    pub fn hook(source_address: Address, new_function: Address) -> Result<Self> {
         use std::borrow::Borrow;
 
         let trampoline = handled_trampoline_allocation(&source_address)
             .context("[Error] - Detour - Failed to allocate trampoline")?;
 
         // Make sure that the address of function stays reliable.
-        let function = std::pin::pin!(function);
-
-        let target_address = &*function as *const F as i64;
-        let address_delta = target_address - source_address.address as i64;
+        let address_of_hook_function = new_function.address as i64;
+        println!(
+            "Address of hook function: {:x?}",
+            (address_of_hook_function as usize).to_be_bytes()
+        );
+        let address_delta = address_of_hook_function - source_address.address as i64;
 
         let hook_length = get_length_of_instructions(
             &source_address,
@@ -307,25 +342,26 @@ impl Detour {
                 5i64
             };
 
-        // // check if a jmp rel32 can reach
+        println!("Writing to original function");
+        // check if a jmp rel32 can reach
         if jmp_to_hooked_function_length == 14i64 {
             // need absolute 14 byte jmp
             let instructions = vec![
                 insn64!(JMP qword ptr [RIP + 0])
                     .encode()
-                    .context("jump_from_original_to_hook_function")?,
-                (trampoline_address.address as usize).to_be_bytes().to_vec(),
+                    .context("jump_from_original_to_hook_function abs jmp")?,
+                (address_of_hook_function as usize).to_be_bytes().to_vec(),
             ];
             let jump_from_original_to_hook_function: Vec<u8> =
                 instructions.into_iter().flatten().collect();
             unsafe { source_address.write(jump_from_original_to_hook_function.as_slice())? };
         } else {
+            let relative_jump_to_address_of_hook_function =
+                address_of_hook_function - source_address.address as i64 - 5;
             let jump_from_original_to_hook_function =
-                trampoline_address.address as i64 - source_address.address as i64 - 5;
-            let jump_from_original_to_hook_function =
-                insn64!(JMP(jump_from_original_to_hook_function))
+                insn64!(JMP(relative_jump_to_address_of_hook_function as i32))
                     .encode()
-                    .context("jump_from_original_to_hook_function")?;
+                    .context("jump_from_original_to_hook_function relative jmp")?;
             unsafe { source_address.write(jump_from_original_to_hook_function.as_slice())? };
         }
 
@@ -336,18 +372,6 @@ impl Detour {
                 hook_length
             ));
         }
-
-        // Not needed as all bytes are initialized to 0x90
-        // let nops = (0..hook_length - jmp_to_hooked_function_length as usize)
-        //     .map(|_| 0x90)
-        //     .collect::<Vec<u8>>();
-        // if !nops.is_empty() {
-        //     unsafe {
-        //         source_address
-        //             .add(jmp_to_hooked_function_length as usize)
-        //             .write(nops.as_slice())?
-        //     };
-        // }
 
         // restore page protection
         modify_page_protection(source_address, hook_length, old_page_protection)?;
@@ -929,7 +953,7 @@ mod tests {
             .join("\n")
     }
 
-    fn function_to_hook() {
+    fn victim_func() -> i32 {
         // This is a function that we will hook
         // It needs to be at least 14 bytes long
         let a = 1;
@@ -940,62 +964,32 @@ mod tests {
         let f = e + 1;
         let g = f + 1;
         println!("Hello, world! {}", g);
+        c + f
+    }
+
+    fn attacker_func() -> i32 {
+        let a = 5;
+        let b = 8;
+        let c = a + b;
+        let d = c + 1;
+        let e = d + 1;
+        let f = e + 1;
+        let g = f + 1;
+        println!("Hello, hook! {}", g);
+        g + f
     }
 
     #[test]
     fn it_works() -> Result<()> {
-        // Encode a simple `add` function with a stack-frame in Sys-V ABI.
-        // let mut buf = (0..128).collect::<Vec<u8>>();
-        // let buf = vec![0u8; 128];
-        // let buf = (0..128).collect::<Vec<u8>>();
-        // let buf = buf
-        //     .as_slice()
-        //     .chunks(2)
-        //     .map(|chunk| vec![0x04u8, chunk[1]])
-        //     .flatten()
-        //     .collect::<Vec<u8>>();
-        // let target_address = buf.as_ptr();
-        let target_address = function_to_hook as *const () as *mut u8;
+        let victim_address = unsafe { std::mem::transmute::<_, u64>(victim_func as fn() -> i32) };
+        let attacker_address =
+            unsafe { std::mem::transmute::<_, u64>(attacker_func as fn() -> i32) };
 
-        let detour = Detour::hook(
-            Address {
-                address: target_address as *mut u8,
-            },
-            || {
-                println!("Hello, hook!");
-            },
-        )
-        .context("Creating Detour Hook")?;
+        let _detour = Detour::hook(victim_address.into(), attacker_address.into())
+            .context("Creating Detour Hook")?;
 
-        // print bytes in original code
-        // buf.iter().for_each(|x| print!("{:02x} ", x));
+        assert_eq!(33, victim_func());
 
-        // print new bytes at target_address
-        println!("after hooking:");
-        // Address {
-        //     address: target_address,
-        // }
-        // .print_up_to(50)?;
-        let p = detour.source_address.memory_slice(0xFF);
-        p.iter().for_each(|x| print!("{:02x} ", x));
-
-        println!("---");
-        println!();
-        println!(
-            "tramp_addr: {} ({:x?})",
-            detour.trampoline_address,
-            (detour.trampoline_address.address as usize).to_be_bytes()
-        );
-        println!("now calling function:");
-        println!("---");
-
-        // print bytes in trampoline
-        let trampoline = detour.trampoline_address.memory_slice(0xFF);
-        trampoline.iter().for_each(|x| print!("{:02x} ", x));
-        println!();
-        function_to_hook();
-
-        // Ok(())
-        Err(anyhow::anyhow!("Alibi Error"))
+        Ok(())
     }
 }
